@@ -1,8 +1,11 @@
 # ekstools
 this repo consist of different command line tools which is customise according to the day to day use case 
 
-update_aws_auth.py
+Tool 1: 
+update_aws_auth.py 
+This script is used for adding the AWS IAM user as readonly or admin user 
 
+update_aws_auth.py
 Save the script code in a file, for example, update_aws_auth.py.
 
 Install the required dependencies by running the following command in your terminal:
@@ -19,6 +22,4 @@ This command will add the my-user IAM user with the specified ARN to the aws-aut
 You can also run python update_aws_auth.py --help to see all available options and their descriptions.
 
 4 for admin user 
-
 python update_aws_auth.py --cluster-name my-eks-cluster --user-arn arn:aws:iam::123456789012:user/my-user --admin
-
