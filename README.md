@@ -1,6 +1,8 @@
 # ekstools
 this repo consist of different command line tools which is customise according to the day to day use case 
 ##############################################################################################################
+
+
 Tool 1: update_aws_auth.py 
 update_aws_auth.py 
 This script is used for adding the AWS IAM user as readonly or admin user 
@@ -13,30 +15,37 @@ Install the required dependencies by running the following command in your termi
 1 Copy code
 
 2 pip install boto3 click
+
 Set up your AWS credentials by either exporting them as environment variables or using the aws configure command. The AWS CLI documentation has more information on how to do this: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html
 
 3 Run the script with the required arguments. Here's an example:
+
 python update_aws_auth.py --cluster-name my-eks-cluster --user-arn arn:aws:iam::123456789012:user/my-user --read-only
 This command will add the my-user IAM user with the specified ARN to the aws-auth ConfigMap for the my-eks-cluster EKS cluster with read-only permissions. If the user is already present in the ConfigMap, the script will display an error message and exit.
 
 You can also run python update_aws_auth.py --help to see all available options and their descriptions.
 
 4 for admin user 
+
 python update_aws_auth.py --cluster-name my-eks-cluster --user-arn arn:aws:iam::123456789012:user/my-user --admin
 
 ##############################################################################################################
+
+
 Tool 2 : add_iam_role_to_aws_auth.py
 
 add_iam_role_to_aws_auth.py
+
 Python script that allows you to add IAM roles to the aws-auth ConfigMap in an EKS cluster:
 
 This script uses the boto3 library and the click package, so you'll need to install them with the following command:
-Copy code
-pip install boto3 click
+
+1 pip install boto3 click
+
 To use the script, save it to a file (e.g. add_iam_role_to_aws_auth.py) and run it with the required arguments. Here's an example:
 
-Copy code
-python add_iam_role_to_aws_auth.py --cluster-name my-eks-cluster --role-arn arn:aws:iam::123456789012:role/my-role --username my-role --read-only
+2 python add_iam_role_to_aws_auth.py --cluster-name my-eks-cluster --role-arn arn:aws:iam::123456789012:role/my-role --username my-role --read-only
+
 This command will add the my-role IAM role with the specified ARN to the aws-auth ConfigMap for the my-eks-cluster EKS cluster with read-only permissions. If the role is already present in the ConfigMap, the script will display an error message and exit.
 You can also use the --admin flag to add the role as an admin. If neither --read-only nor --admin is specified, the role will be added as a node.
 
