@@ -4,7 +4,7 @@ this repo consist of different command line tools which is customise according t
 
 
 Tool 1: update_aws_auth.py 
-update_aws_auth.py 
+
 This script is used for adding the AWS IAM user as readonly or admin user 
 
 update_aws_auth.py
