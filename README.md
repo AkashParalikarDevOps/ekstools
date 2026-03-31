@@ -10,11 +10,12 @@ Manages the `aws-auth` ConfigMap in an EKS cluster — the Kubernetes ConfigMap 
 controls which AWS IAM identities can access your cluster.
 
 Supports:
-- Adding / removing **IAM users**
-- Adding / removing **IAM roles**
+- Adding / removing **IAM users** and **IAM roles** individually
+- **GitOps-style sync** from a desired-state YAML file (`iam-auth.yaml`)
 - Two access levels: **admin** and **developer**
 - `--dry-run` mode to preview changes safely
 - No `kubectl` or kubeconfig required — authenticates directly via AWS credentials
+- Production-grade **GitHub Actions pipeline** for automated reconciliation
 
 ---
 
@@ -42,6 +43,9 @@ This tool:
 |------|-----------------|--------|
 | `--access admin` | `system:masters` | Full cluster-admin. Bound to the built-in `cluster-admin` ClusterRole. |
 | `--access developer` | `eks-developers` | Custom group. Requires a ClusterRoleBinding (see below). |
+
+You may also supply a `groups:` list directly in `iam-auth.yaml` to use custom
+groups (e.g. for node group roles that need `system:bootstrappers`).
 
 ---
 
@@ -74,25 +78,127 @@ pip install -r requirements.txt
 
 ---
 
-### Usage
+### Commands
 
-#### Add an IAM user as admin
+| Command | Description |
+|---------|-------------|
+| `sync` | Reconcile aws-auth to match a desired-state YAML file (GitOps) |
+| `add-user` | Add a single IAM user |
+| `add-role` | Add a single IAM role |
+| `remove-user` | Remove a single IAM user |
+| `remove-role` | Remove a single IAM role |
+| `list` | List all current aws-auth entries |
+
+---
+
+### `sync` — GitOps reconciliation (recommended)
+
+The `sync` command treats `iam-auth.yaml` as the **single source of truth**:
+
+- Entries in the file but not in the cluster → **added**
+- Entries in the cluster but not in the file → **removed**
+- Entries present in both but with different config → **updated**
+
+A Terraform-style plan is always printed before any write.
+
+#### 1. Define desired state in `iam-auth.yaml`
+
+```yaml
+users:
+  # Cluster administrator — full system:masters access
+  - arn: arn:aws:iam::123456789012:user/alice
+    access: admin
+    username: alice          # optional; defaults to last ARN segment
+
+  # Developer — eks-developers group (ClusterRoleBinding required)
+  - arn: arn:aws:iam::123456789012:user/bob
+    access: developer
+
+roles:
+  # CI/CD pipeline role
+  - arn: arn:aws:iam::123456789012:role/github-actions-role
+    access: developer
+    username: github-ci
+
+  # Node group role — use explicit groups to override the 'access' shorthand
+  - arn: arn:aws:iam::123456789012:role/eks-node-group-role
+    username: "system:node:{{EC2PrivateDNSName}}"
+    groups:
+      - system:bootstrappers
+      - system:nodes
+```
+
+**`iam-auth.yaml` field reference:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `arn` | Yes | Full IAM user or role ARN |
+| `access` | Yes* | `admin` or `developer` (*not required if `groups` is set) |
+| `groups` | Yes* | Explicit Kubernetes groups list (*overrides `access` if both are set) |
+| `username` | No | Kubernetes username; defaults to the last path segment of the ARN |
+
+#### 2. Preview the changes (dry-run)
+
+```bash
+python aws_auth_manager.py sync \
+  --cluster-name my-eks-cluster \
+  --region us-east-1 \
+  --file iam-auth.yaml \
+  --dry-run
+```
+
+Sample output:
+
+```
+────────────────────────────────────────────────────────────────
+  aws-auth  |  SYNC PLAN
+────────────────────────────────────────────────────────────────
+
+  IAM Users (mapUsers)
+  ······························
+  + ADD
+    arn      : arn:aws:iam::123456789012:user/alice
+    username : alice
+    groups   : system:masters
+
+  - REMOVE
+    arn      : arn:aws:iam::123456789012:user/old-user
+    username : old-user
+    groups   : eks-developers
+
+  IAM Roles (mapRoles)
+  ······························
+  ~ UPDATE
+    arn      : arn:aws:iam::123456789012:role/github-actions-role
+    groups   : ['system:masters'] → ['eks-developers']
+
+────────────────────────────────────────────────────────────────
+  Plan: 1 to add, 1 to remove, 1 to update.
+────────────────────────────────────────────────────────────────
+
+[DRY-RUN] No changes applied.
+```
+
+#### 3. Apply
+
+```bash
+python aws_auth_manager.py sync \
+  --cluster-name my-eks-cluster \
+  --region us-east-1 \
+  --file iam-auth.yaml
+```
+
+---
+
+### Individual commands
+
+#### Add an IAM user
 
 ```bash
 python aws_auth_manager.py add-user \
   --cluster-name my-eks-cluster \
   --user-arn arn:aws:iam::123456789012:user/alice \
   --access admin \
-  --region us-east-1
-```
-
-#### Add an IAM user as developer
-
-```bash
-python aws_auth_manager.py add-user \
-  --cluster-name my-eks-cluster \
-  --user-arn arn:aws:iam::123456789012:user/bob \
-  --access developer \
   --region us-east-1
 ```
 
@@ -106,54 +212,13 @@ python aws_auth_manager.py add-user \
   --access developer
 ```
 
-#### Add an IAM role as admin
+#### Add an IAM role
 
 ```bash
 python aws_auth_manager.py add-role \
   --cluster-name my-eks-cluster \
   --role-arn arn:aws:iam::123456789012:role/MyAdminRole \
   --access admin
-```
-
-#### Add an IAM role as developer
-
-```bash
-python aws_auth_manager.py add-role \
-  --cluster-name my-eks-cluster \
-  --role-arn arn:aws:iam::123456789012:role/MyDevRole \
-  --access developer
-```
-
-#### List current aws-auth entries
-
-```bash
-python aws_auth_manager.py list \
-  --cluster-name my-eks-cluster \
-  --region us-east-1
-```
-
-Sample output:
-
-```
-────────────────────────────────────────────────────────────────
-  aws-auth  |  cluster: my-eks-cluster  |  region: us-east-1
-────────────────────────────────────────────────────────────────
-
-  IAM Users (mapUsers)
-  ··················
-  userarn  : arn:aws:iam::123456789012:user/alice
-  username : alice
-  groups   : system:masters
-
-  userarn  : arn:aws:iam::123456789012:user/bob
-  username : bob
-  groups   : eks-developers
-
-  IAM Roles (mapRoles)
-  ··················
-  rolearn  : arn:aws:iam::123456789012:role/MyNodeRole
-  username : system:node:{{EC2PrivateDNSName}}
-  groups   : system:bootstrappers, system:nodes
 ```
 
 #### Remove an IAM user
@@ -172,9 +237,17 @@ python aws_auth_manager.py remove-role \
   --role-arn arn:aws:iam::123456789012:role/MyDevRole
 ```
 
-#### Dry-run (preview without applying)
+#### List current aws-auth entries
 
-Any `add-*` or `remove-*` command accepts `--dry-run`:
+```bash
+python aws_auth_manager.py list \
+  --cluster-name my-eks-cluster \
+  --region us-east-1
+```
+
+#### Dry-run any command
+
+All commands accept `--dry-run` to preview changes without applying:
 
 ```bash
 python aws_auth_manager.py add-user \
@@ -184,11 +257,95 @@ python aws_auth_manager.py add-user \
   --dry-run
 ```
 
-#### Debug / verbose logging
+#### Verbose / debug logging
 
 ```bash
-python aws_auth_manager.py add-user ... --verbose
+python aws_auth_manager.py sync ... --verbose
 ```
+
+---
+
+### GitHub Actions pipeline
+
+The pipeline in `.github/workflows/sync-eks-auth.yml` automates sync via GitOps:
+edit `iam-auth.yaml`, open a PR, and the plan is posted as a comment. Merge to
+`main` and the cluster is reconciled automatically.
+
+```
+PR opened/updated
+  └─▶ validate  (schema check — no AWS)
+  └─▶ plan      (dry-run against live cluster)
+  └─▶ comment   (posts plan to PR)
+
+Merge to main
+  └─▶ validate
+  └─▶ plan
+  └─▶ apply     (reconciles cluster — requires "production" env approval)
+```
+
+#### Setup
+
+**1. Configure OIDC trust between GitHub Actions and AWS**
+
+Create an IAM role with the following trust policy (replace `ACCOUNT_ID`,
+`GITHUB_ORG`, and `REPO_NAME`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:GITHUB_ORG/REPO_NAME:*"
+        }
+      }
+    }
+  ]
+}
+```
+
+Attach the IAM policy from the [Required IAM permissions](#required-iam-permissions)
+section to this role.
+
+**2. Add GitHub secrets and variables**
+
+| Name | Type | Value |
+|------|------|-------|
+| `AWS_ROLE_ARN` | Secret | ARN of the OIDC role created above |
+| `EKS_CLUSTER_NAME` | Variable | Name of your EKS cluster |
+| `EKS_REGION` | Variable | AWS region (e.g. `us-east-1`) |
+
+Set at: **Settings → Secrets and variables → Actions**
+
+**3. Create the `production` GitHub environment**
+
+Go to **Settings → Environments → New environment**, name it `production`, and
+add at least one required reviewer. The `apply` job will pause for approval
+before writing the ConfigMap.
+
+**4. Workflow triggers**
+
+| Event | Jobs run |
+|-------|----------|
+| PR to `main` (changes to `iam-auth.yaml` or `aws_auth_manager.py`) | validate → plan → comment |
+| Push to `main` (same paths) | validate → plan → apply |
+| Manual dispatch (`dry_run=true`) | validate → plan |
+| Manual dispatch (`dry_run=false`) | validate → plan → apply |
+
+#### Multi-cluster support
+
+To manage multiple clusters, create per-cluster YAML files and extend the
+workflow matrix. See the `MULTI-CLUSTER SUPPORT` section at the bottom of
+`.github/workflows/sync-eks-auth.yml` for a complete example.
 
 ---
 
@@ -273,14 +430,14 @@ Set the region via `--region` flag or the `AWS_DEFAULT_REGION` environment varia
 ```bash
 export AWS_DEFAULT_REGION=us-west-2
 export AWS_PROFILE=my-prod-profile
-python aws_auth_manager.py list --cluster-name my-cluster
+python aws_auth_manager.py sync --cluster-name my-cluster --file iam-auth.yaml
 ```
 
 ---
 
 ### Required IAM permissions
 
-Attach the following IAM policy to the identity running this tool:
+Attach the following policy to the identity (or OIDC role) running this tool:
 
 ```json
 {
@@ -315,7 +472,6 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["aws-auth"]
-    namespaces: ["kube-system"]
     verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -338,6 +494,7 @@ roleRef:
 
 ```bash
 python aws_auth_manager.py --help
+python aws_auth_manager.py sync --help
 python aws_auth_manager.py add-user --help
 python aws_auth_manager.py add-role --help
 python aws_auth_manager.py remove-user --help
@@ -357,4 +514,6 @@ python aws_auth_manager.py list --help
 | `Permission denied reading aws-auth` | IAM identity not yet in the cluster | Use the cluster-creator credentials first |
 | `already present in aws-auth` | Duplicate entry | Run `remove-user` / `remove-role` first, then re-add |
 | `is not ACTIVE` | Cluster is creating/deleting | Wait for cluster to reach ACTIVE state |
-
+| `Invalid IAM user/role ARN` | Malformed ARN in `iam-auth.yaml` | Verify ARN format: `arn:aws:iam::ACCOUNT:user/NAME` |
+| `must specify 'access' or 'groups'` | Entry missing required field | Add `access: admin` or `access: developer` to the entry |
+| `Duplicate ARN in desired-state file` | Same ARN listed twice | Remove the duplicate from `iam-auth.yaml` |
