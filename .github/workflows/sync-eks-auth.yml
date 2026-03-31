@@ -1,0 +1,345 @@
+# .github/workflows/sync-eks-auth.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Production pipeline: reconcile the EKS aws-auth ConfigMap from iam-auth.yaml.
+#
+# ┌─────────────┐    ┌────────┐    ┌─────────┐    ┌───────┐
+# │  validate   │───▶│  plan  │───▶│ comment │    │ apply │
+# │ (YAML only) │    │(dry-run│    │ (PR only│    │(main/ │
+# │  no AWS)    │    │ + AWS) │    │         │    │manual)│
+# └─────────────┘    └────────┘    └─────────┘    └───────┘
+#
+# ── Triggers ──────────────────────────────────────────────────────────────────
+#   push to main     → validate + plan + apply
+#   pull_request     → validate + plan + PR comment (no apply)
+#   workflow_dispatch → validate + plan + apply (unless dry_run=true)
+#
+# ── Required GitHub secrets ───────────────────────────────────────────────────
+#   AWS_ROLE_ARN          IAM role ARN assumed via OIDC
+#                         Must have: eks:DescribeCluster, sts:GetCallerIdentity,
+#                         and k8s RBAC write on kube-system/configmaps.
+#
+# ── Required GitHub variables ─────────────────────────────────────────────────
+#   EKS_CLUSTER_NAME      EKS cluster name
+#   EKS_REGION            AWS region (e.g. us-east-1)
+#
+# ── GitHub environment ────────────────────────────────────────────────────────
+#   Create a "production" environment at Settings > Environments and add at
+#   least one required reviewer.  The apply job will pause for approval before
+#   writing the ConfigMap on any push to main.
+#
+# ── Multi-cluster support ─────────────────────────────────────────────────────
+#   See the "MULTI-CLUSTER" section at the bottom of this file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Sync EKS aws-auth
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "iam-auth.yaml"
+      - "aws_auth_manager.py"
+      - ".github/workflows/sync-eks-auth.yml"
+
+  pull_request:
+    branches: [main]
+    paths:
+      - "iam-auth.yaml"
+      - "aws_auth_manager.py"
+      - ".github/workflows/sync-eks-auth.yml"
+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run only — print plan without applying changes"
+        type: boolean
+        default: true
+        required: false
+
+# ── Permissions ───────────────────────────────────────────────────────────────
+# id-token: write   → OIDC token exchange with AWS
+# contents: read    → checkout
+# pull-requests: write → create/update PR comment
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+# Cancel any in-progress run for the same ref to prevent concurrent writes.
+concurrency:
+  group: eks-auth-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1: validate
+# Fast schema check — no AWS calls.  Catches YAML errors immediately so
+# developers don't wait for credentials to discover a typo.
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  validate:
+    name: Validate iam-auth.yaml
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate desired-state schema
+        # Calls _load_desired_state() which validates ARNs, access levels,
+        # group types, and duplicate detection — all without touching AWS.
+        run: |
+          python - <<'PYEOF'
+          import sys, aws_auth_manager as am
+          try:
+              users, roles = am._load_desired_state("iam-auth.yaml")
+              print(f"[OK] iam-auth.yaml valid: {len(users)} user(s), {len(roles)} role(s)")
+          except Exception as exc:
+              print(f"[FAIL] {exc}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: plan
+  # Dry-run against the live cluster.  Captures the plan output so the comment
+  # job can post it to the PR without re-running against AWS.
+  # ─────────────────────────────────────────────────────────────────────────────
+  plan:
+    name: Plan — ${{ vars.EKS_CLUSTER_NAME }} (${{ vars.EKS_REGION }})
+    runs-on: ubuntu-latest
+    needs: validate
+
+    outputs:
+      plan_output: ${{ steps.plan.outputs.plan_output }}
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.EKS_REGION }}
+          role-session-name: eks-auth-plan-${{ github.run_id }}
+
+      - name: Dry-run sync and capture plan
+        id: plan
+        run: |
+          set +e    # capture output even if the command fails
+          PLAN_OUTPUT=$(python aws_auth_manager.py sync \
+            --cluster-name "${{ vars.EKS_CLUSTER_NAME }}" \
+            --region       "${{ vars.EKS_REGION }}" \
+            --file         iam-auth.yaml \
+            --dry-run 2>&1)
+          EXIT_CODE=$?
+          set -e
+
+          # Persist multiline output via heredoc delimiter
+          {
+            echo "plan_output<<PLAN_EOF"
+            echo "$PLAN_OUTPUT"
+            echo "PLAN_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Signal whether any changes are pending (used by apply job guard
+          # and by the PR comment to show the right call-to-action message).
+          if echo "$PLAN_OUTPUT" | grep -qE '^\s+Plan: [^0]'; then
+            echo "has_changes=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "$PLAN_OUTPUT"
+          exit $EXIT_CODE
+
+      - name: Append plan to Job Summary
+        if: always()
+        run: |
+          {
+            printf '## aws-auth sync plan\n\n'
+            printf '**Cluster:** `%s`  **Region:** `%s`\n\n' \
+              "${{ vars.EKS_CLUSTER_NAME }}" "${{ vars.EKS_REGION }}"
+            printf '```\n%s\n```\n' "${{ steps.plan.outputs.plan_output }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 3: comment
+  # Posts the plan as a PR comment.  Subsequent pushes to the same PR update
+  # the existing comment rather than creating duplicates.
+  # ─────────────────────────────────────────────────────────────────────────────
+  comment:
+    name: Post plan to PR
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Find existing plan comment
+        id: find_comment
+        uses: peter-evans/find-comment@v3
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: "github-actions[bot]"
+          body-includes: "<!-- eks-auth-sync-plan -->"
+
+      - name: Create or update plan comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find_comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body: |
+            <!-- eks-auth-sync-plan -->
+            ## EKS aws-auth Sync Plan
+
+            > **Cluster:** `${{ vars.EKS_CLUSTER_NAME }}`  **Region:** `${{ vars.EKS_REGION }}`
+            > **Branch:** `${{ github.head_ref }}`  **Triggered by:** @${{ github.actor }}
+
+            <details open>
+            <summary>Plan output</summary>
+
+            ```
+            ${{ needs.plan.outputs.plan_output }}
+            ```
+
+            </details>
+
+            ---
+            ${{
+              needs.plan.outputs.has_changes == 'true'
+                && ':warning: **Changes detected.** This plan will be applied automatically when this PR is merged to `main`.'
+                || ':white_check_mark: **No changes.** The aws-auth ConfigMap already matches `iam-auth.yaml`.'
+            }}
+
+            <sub>Last updated: ${{ github.event.pull_request.updated_at }}</sub>
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 4: apply
+  # Writes the new ConfigMap.  Runs only on push to main or manual dispatch
+  # with dry_run=false.  Protected by the "production" GitHub environment which
+  # can require manual approval before execution.
+  # ─────────────────────────────────────────────────────────────────────────────
+  apply:
+    name: Apply — ${{ vars.EKS_CLUSTER_NAME }} (${{ vars.EKS_REGION }})
+    runs-on: ubuntu-latest
+    needs: plan
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+    environment: production    # configure required reviewers at Settings > Environments
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.EKS_REGION }}
+          role-session-name: eks-auth-apply-${{ github.run_id }}
+
+      - name: Apply sync
+        id: apply
+        run: |
+          python aws_auth_manager.py sync \
+            --cluster-name "${{ vars.EKS_CLUSTER_NAME }}" \
+            --region       "${{ vars.EKS_REGION }}" \
+            --file         iam-auth.yaml \
+            --verbose
+
+      - name: Write apply summary
+        if: always()
+        run: |
+          STATUS="${{ steps.apply.outcome == 'success' && '✅ SUCCESS' || '❌ FAILED' }}"
+          {
+            printf '## aws-auth sync apply\n\n'
+            printf '| | |\n|---|---|\n'
+            printf '| Cluster | `%s` |\n' "${{ vars.EKS_CLUSTER_NAME }}"
+            printf '| Region | `%s` |\n'  "${{ vars.EKS_REGION }}"
+            printf '| Status | %s |\n'    "$STATUS"
+            printf '| Triggered by | @%s |\n' "${{ github.actor }}"
+            printf '| Commit | [`%s`](%s/%s/commit/%s) |\n' \
+              "${GITHUB_SHA:0:7}" \
+              "${{ github.server_url }}" "${{ github.repository }}" "${{ github.sha }}"
+            printf '| Run | [%s](%s/%s/actions/runs/%s) |\n' \
+              "${{ github.run_id }}" \
+              "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}"
+            printf '\n### Plan that was applied\n\n```\n%s\n```\n' \
+              "${{ needs.plan.outputs.plan_output }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MULTI-CLUSTER SUPPORT
+# ─────────────────────────────────────────────────────────────────────────────
+# To sync multiple clusters, add per-cluster YAML files and extend the plan/
+# apply jobs with a matrix strategy.  Example:
+#
+#   jobs:
+#     plan:
+#       strategy:
+#         fail-fast: false          # show all failures, not just the first
+#         matrix:
+#           cluster:
+#             - label:        staging
+#               cluster_name: my-eks-staging
+#               region:       us-east-1
+#               environment:  staging
+#               auth_file:    iam-auth-staging.yaml
+#             - label:        production
+#               cluster_name: my-eks-prod
+#               region:       eu-west-1
+#               environment:  production
+#               auth_file:    iam-auth-prod.yaml
+#       name: Plan (${{ matrix.cluster.label }})
+#       environment: ${{ matrix.cluster.environment }}
+#       ...
+#       steps:
+#         - name: Configure AWS credentials
+#           uses: aws-actions/configure-aws-credentials@v4
+#           with:
+#             role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', matrix.cluster.label)] }}
+#             aws-region: ${{ matrix.cluster.region }}
+#         - name: Dry-run sync
+#           run: |
+#             python aws_auth_manager.py sync \
+#               --cluster-name "${{ matrix.cluster.cluster_name }}" \
+#               --region       "${{ matrix.cluster.region }}" \
+#               --file         "${{ matrix.cluster.auth_file }}" \
+#               --dry-run
+#
+# Per-cluster secrets: AWS_ROLE_ARN_STAGING, AWS_ROLE_ARN_PRODUCTION
+# Per-cluster YAML files: iam-auth-staging.yaml, iam-auth-prod.yaml
+# Per-cluster GitHub environments: staging (no gates), production (approval)
+# ─────────────────────────────────────────────────────────────────────────────

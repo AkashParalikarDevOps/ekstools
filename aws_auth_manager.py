@@ -18,7 +18,7 @@ import os
 import re
 import sys
 import tempfile
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import boto3
 import click
@@ -449,6 +449,320 @@ def _print_rbac_hint(principal_type: str, username: str) -> None:
     )
 
 
+# ─── Sync helpers ─────────────────────────────────────────────────────────────
+
+_VALID_ACCESS_LEVELS: Set[str] = set(ACCESS_LEVELS.keys())
+
+
+def _resolve_entry(raw: Dict, kind: str) -> Dict:
+    """
+    Normalise one entry from the desired-state YAML into aws-auth format.
+
+    kind must be ``"user"`` or ``"role"``.
+
+    Resolution rules (in priority order):
+
+    1. ``groups`` key present  → use it directly (overrides ``access``).
+    2. ``access`` key present  → expand via ACCESS_LEVELS.
+    3. Neither present         → raise ClickException.
+
+    ``username`` defaults to the last path segment of the ARN when absent.
+    """
+    arn_key = "userarn" if kind == "user" else "rolearn"
+    arn = (raw.get("arn") or "").strip()
+
+    if not arn:
+        raise click.ClickException(
+            f"A {kind} entry in the desired-state file is missing the 'arn' key."
+        )
+
+    if kind == "user" and not _IAM_USER_ARN_RE.match(arn):
+        raise click.ClickException(
+            f"Invalid IAM user ARN in desired-state file: '{arn}'."
+        )
+    if kind == "role" and not _IAM_ROLE_ARN_RE.match(arn):
+        raise click.ClickException(
+            f"Invalid IAM role ARN in desired-state file: '{arn}'."
+        )
+
+    username = ((raw.get("username") or "") or arn.split("/")[-1]).strip()
+
+    if "groups" in raw:
+        groups = raw["groups"]
+        if not isinstance(groups, list) or not groups:
+            raise click.ClickException(
+                f"Entry '{arn}': 'groups' must be a non-empty list."
+            )
+    elif "access" in raw:
+        access = str(raw["access"]).lower()
+        if access not in _VALID_ACCESS_LEVELS:
+            raise click.ClickException(
+                f"Entry '{arn}': invalid access '{access}'. "
+                f"Valid values: {', '.join(sorted(_VALID_ACCESS_LEVELS))}."
+            )
+        groups = ACCESS_LEVELS[access]["groups"]
+    else:
+        raise click.ClickException(
+            f"Entry '{arn}': must specify either 'access' or 'groups'."
+        )
+
+    return {arn_key: arn, "username": username, "groups": groups}
+
+
+def _load_desired_state(file_path: str) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Parse and validate the desired-state YAML file.
+
+    Expected format::
+
+        users:
+          - arn: arn:aws:iam::123456789012:user/alice
+            access: admin           # 'admin' or 'developer'
+            username: alice         # optional; defaults to last ARN segment
+          - arn: ...
+            groups:                 # explicit groups override 'access'
+              - custom-group
+
+        roles:
+          - arn: arn:aws:iam::123456789012:role/my-role
+            access: developer
+          - arn: arn:aws:iam::123456789012:role/node-role
+            username: "system:node:{{EC2PrivateDNSName}}"
+            groups:
+              - system:bootstrappers
+              - system:nodes
+
+    Returns ``(desired_users, desired_roles)`` as lists of aws-auth entry dicts.
+    Raises ``click.ClickException`` on any validation error.
+    """
+    try:
+        with open(file_path) as fh:
+            raw = yaml.safe_load(fh)
+    except FileNotFoundError:
+        raise click.ClickException(
+            f"Desired-state file not found: '{file_path}'."
+        )
+    except yaml.YAMLError as exc:
+        raise click.ClickException(
+            f"Failed to parse desired-state YAML '{file_path}': {exc}"
+        )
+
+    if not isinstance(raw, dict):
+        raise click.ClickException(
+            "Desired-state file must be a YAML mapping with 'users' and/or 'roles' keys."
+        )
+
+    raw_users = raw.get("users") or []
+    raw_roles = raw.get("roles") or []
+
+    if not isinstance(raw_users, list):
+        raise click.ClickException("'users' in desired-state file must be a YAML list.")
+    if not isinstance(raw_roles, list):
+        raise click.ClickException("'roles' in desired-state file must be a YAML list.")
+
+    desired_users: List[Dict] = []
+    seen_user_arns: Set[str] = set()
+    for entry in raw_users:
+        if not isinstance(entry, dict):
+            raise click.ClickException("Each user entry must be a YAML mapping.")
+        resolved = _resolve_entry(entry, "user")
+        arn = resolved["userarn"]
+        if arn in seen_user_arns:
+            raise click.ClickException(
+                f"Duplicate user ARN in desired-state file: '{arn}'."
+            )
+        seen_user_arns.add(arn)
+        desired_users.append(resolved)
+
+    desired_roles: List[Dict] = []
+    seen_role_arns: Set[str] = set()
+    for entry in raw_roles:
+        if not isinstance(entry, dict):
+            raise click.ClickException("Each role entry must be a YAML mapping.")
+        resolved = _resolve_entry(entry, "role")
+        arn = resolved["rolearn"]
+        if arn in seen_role_arns:
+            raise click.ClickException(
+                f"Duplicate role ARN in desired-state file: '{arn}'."
+            )
+        seen_role_arns.add(arn)
+        desired_roles.append(resolved)
+
+    return desired_users, desired_roles
+
+
+def _compute_diff(
+    current: List[Dict],
+    desired: List[Dict],
+    arn_key: str,
+) -> Tuple[List[Dict], List[Dict], List[Tuple[Dict, Dict]]]:
+    """
+    Compare current ConfigMap entries against desired entries by ARN.
+
+    Returns ``(to_add, to_remove, to_update)`` where:
+
+    * ``to_add``    – desired entries whose ARN is absent from current.
+    * ``to_remove`` – current entries whose ARN is absent from desired.
+    * ``to_update`` – ``(current, desired)`` pairs where ARN matches but
+                      username or groups differ.
+
+    All returned lists are sorted by ARN for deterministic, readable output.
+    """
+    cur = {e[arn_key]: e for e in current if arn_key in e}
+    des = {e[arn_key]: e for e in desired if arn_key in e}
+
+    to_add    = sorted(
+        [e for a, e in des.items() if a not in cur], key=lambda e: e[arn_key]
+    )
+    to_remove = sorted(
+        [e for a, e in cur.items() if a not in des], key=lambda e: e[arn_key]
+    )
+    to_update = sorted(
+        [(cur[a], des[a]) for a in cur.keys() & des.keys() if cur[a] != des[a]],
+        key=lambda pair: pair[1][arn_key],
+    )
+
+    return to_add, to_remove, to_update
+
+
+def _print_plan(
+    user_add:    List[Dict],
+    user_remove: List[Dict],
+    user_update: List[Tuple[Dict, Dict]],
+    role_add:    List[Dict],
+    role_remove: List[Dict],
+    role_update: List[Tuple[Dict, Dict]],
+) -> int:
+    """
+    Print a Terraform-style plan to stdout.
+
+    Returns the total number of changes (0 means no-op).
+    """
+    sep = "─" * 64
+    click.echo(f"\n{sep}")
+    click.echo("  aws-auth  |  SYNC PLAN")
+    click.echo(sep)
+
+    def _one_line(arn_key: str, e: Dict) -> str:
+        return (
+            f"    arn      : {e.get(arn_key, '?')}\n"
+            f"    username : {e.get('username', '?')}\n"
+            f"    groups   : {', '.join(e.get('groups', []))}"
+        )
+
+    sections = [
+        ("IAM Users (mapUsers)", "userarn", user_add, user_remove, user_update),
+        ("IAM Roles (mapRoles)", "rolearn", role_add, role_remove, role_update),
+    ]
+
+    for title, arn_key, to_add, to_remove, to_update in sections:
+        click.echo(f"\n  {title}\n  {'·' * 30}")
+        if not (to_add or to_remove or to_update):
+            click.echo("  (no changes)\n")
+            continue
+
+        for e in to_add:
+            click.echo("  + ADD")
+            click.echo(_one_line(arn_key, e))
+            click.echo()
+        for e in to_remove:
+            click.echo("  - REMOVE")
+            click.echo(_one_line(arn_key, e))
+            click.echo()
+        for cur_e, des_e in to_update:
+            click.echo("  ~ UPDATE")
+            click.echo(f"    arn      : {des_e.get(arn_key, '?')}")
+            if cur_e.get("username") != des_e.get("username"):
+                click.echo(
+                    f"    username : {cur_e.get('username')!r} → {des_e.get('username')!r}"
+                )
+            if cur_e.get("groups") != des_e.get("groups"):
+                click.echo(
+                    f"    groups   : {cur_e.get('groups')} → {des_e.get('groups')}"
+                )
+            click.echo()
+
+    total = (
+        len(user_add) + len(user_remove) + len(user_update)
+        + len(role_add) + len(role_remove) + len(role_update)
+    )
+    click.echo(sep)
+    if total == 0:
+        click.echo("  No changes — aws-auth ConfigMap is already in sync.")
+    else:
+        adds    = len(user_add)    + len(role_add)
+        removes = len(user_remove) + len(role_remove)
+        updates = len(user_update) + len(role_update)
+        parts   = []
+        if adds:    parts.append(f"{adds} to add")
+        if removes: parts.append(f"{removes} to remove")
+        if updates: parts.append(f"{updates} to update")
+        click.echo(f"  Plan: {', '.join(parts)}.")
+    click.echo(sep + "\n")
+    return total
+
+
+def _op_sync(
+    cluster_name: str,
+    region: str,
+    file_path: str,
+    dry_run: bool,
+) -> None:
+    """
+    Reconcile the aws-auth ConfigMap to exactly match the desired state in
+    *file_path*.
+
+    Entries present in *file_path* are added or updated.
+    Entries absent from *file_path* are removed.
+    The YAML file is the single source of truth for mapUsers and mapRoles.
+    """
+    # Step 1 — load desired state (no AWS calls; fail fast on bad YAML).
+    desired_users, desired_roles = _load_desired_state(file_path)
+    logger.info(
+        "Desired state: %d user(s), %d role(s) from '%s'",
+        len(desired_users), len(desired_roles), file_path,
+    )
+
+    v1, ca_path = _build_k8s_client(cluster_name, region)
+    try:
+        cm = _read_configmap(v1)
+        current_users, current_roles = _parse_configmap(cm)
+
+        # Step 2 — compute diff.
+        user_add, user_remove, user_update = _compute_diff(
+            current_users, desired_users, "userarn"
+        )
+        role_add, role_remove, role_update = _compute_diff(
+            current_roles, desired_roles, "rolearn"
+        )
+
+        # Step 3 — print plan.
+        total_changes = _print_plan(
+            user_add, user_remove, user_update,
+            role_add, role_remove, role_update,
+        )
+
+        if dry_run:
+            click.echo("[DRY-RUN] No changes applied.")
+            return
+
+        if total_changes == 0:
+            click.echo(
+                "[OK] ConfigMap already matches desired state. Nothing to do."
+            )
+            return
+
+        # Step 4 — write (full replacement is safe: desired state is complete).
+        _write_configmap(v1, cm, desired_users, desired_roles)
+    finally:
+        os.unlink(ca_path)
+
+    click.echo(
+        f"[OK] aws-auth ConfigMap synced "
+        f"({len(desired_users)} user(s), {len(desired_roles)} role(s))."
+    )
+
+
 # ─── CLI definition ───────────────────────────────────────────────────────────
 
 def _common_options(func):
@@ -580,6 +894,51 @@ def cmd_list(cluster_name, region, verbose):
     """List all IAM users and roles currently in the aws-auth ConfigMap."""
     _setup_logging(verbose)
     _op_list(cluster_name, region)
+
+
+@cli.command("sync")
+@click.option(
+    "--cluster-name", required=True,
+    help="Name of the EKS cluster.",
+)
+@click.option(
+    "--region",
+    default=lambda: os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+    show_default="AWS_DEFAULT_REGION or us-east-1",
+    help="AWS region where the cluster lives.",
+)
+@click.option(
+    "--file", "file_path",
+    default="iam-auth.yaml",
+    show_default=True,
+    type=click.Path(dir_okay=False, readable=True),
+    help="Path to the desired-state YAML file.",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Print the plan but do NOT apply any changes.",
+)
+@click.option("--verbose", is_flag=True, default=False, help="Enable DEBUG-level logging.")
+def cmd_sync(cluster_name, region, file_path, dry_run, verbose):
+    """
+    Reconcile aws-auth ConfigMap to match the desired state in FILE.
+
+    \b
+    Reads IAM users and roles from FILE and compares them against the current
+    aws-auth ConfigMap, printing a plan (+add / -remove / ~update).
+    Unless --dry-run is set, the ConfigMap is updated to exactly match FILE.
+    FILE is the single source of truth: any entry absent from FILE is removed.
+
+    \b
+    Example:
+        python aws_auth_manager.py sync \\
+          --cluster-name my-cluster \\
+          --region us-east-1 \\
+          --file iam-auth.yaml \\
+          --dry-run
+    """
+    _setup_logging(verbose)
+    _op_sync(cluster_name, region, file_path, dry_run)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

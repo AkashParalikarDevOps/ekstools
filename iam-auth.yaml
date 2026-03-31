@@ -1,0 +1,56 @@
+# iam-auth.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Desired-state file for the EKS aws-auth ConfigMap.
+#
+# This file is the SINGLE SOURCE OF TRUTH for cluster access.
+# Running the sync command reconciles the aws-auth ConfigMap to match exactly:
+#
+#   python aws_auth_manager.py sync \
+#     --cluster-name <cluster-name> \
+#     --region <region> \
+#     --file iam-auth.yaml
+#
+# Or with GitHub Actions (see .github/workflows/sync-eks-auth.yml):
+#   - Edit this file and open a PR  → triggers a dry-run plan as a PR comment
+#   - Merge to main                 → triggers the actual apply
+#
+# ─── Access levels ────────────────────────────────────────────────────────────
+#   admin     → groups: [system:masters]    (full cluster-admin)
+#   developer → groups: [eks-developers]   (requires a ClusterRoleBinding)
+#
+# You may also supply 'groups' directly to bypass the access shorthand.
+# If both 'access' and 'groups' are present, 'groups' wins.
+#
+# 'username' is optional and defaults to the last path segment of the ARN.
+# ─────────────────────────────────────────────────────────────────────────────
+
+users:
+  # ── Cluster administrators ──────────────────────────────────────────────────
+  - arn: arn:aws:iam::123456789012:user/alice
+    access: admin
+    username: alice              # optional: explicit k8s username
+
+  # ── Developers ──────────────────────────────────────────────────────────────
+  - arn: arn:aws:iam::123456789012:user/bob
+    access: developer
+    # username omitted → defaults to "bob" (last ARN segment)
+
+roles:
+  # ── CI/CD pipeline role ─────────────────────────────────────────────────────
+  - arn: arn:aws:iam::123456789012:role/github-actions-role
+    access: developer
+    username: github-ci
+
+  # ── EKS managed node group role ─────────────────────────────────────────────
+  # Required for worker nodes to register with the cluster.
+  # Uses explicit groups instead of the 'access' shorthand.
+  - arn: arn:aws:iam::123456789012:role/eks-node-group-role
+    username: "system:node:{{EC2PrivateDNSName}}"
+    groups:
+      - system:bootstrappers
+      - system:nodes
+
+  # ── Read-only ops role ───────────────────────────────────────────────────────
+  - arn: arn:aws:iam::123456789012:role/readonly-ops-role
+    access: developer
+    username: readonly-ops
